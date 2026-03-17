@@ -576,6 +576,8 @@ export default function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [syncingAll, setSyncingAll] = useState(false);
+  const [syncProgress, setSyncProgress] = useState(0);
+  const [syncStatus, setSyncStatus] = useState("");
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [showGuide, setShowGuide] = useState(false);
   const [balanceDiscrepancies, setBalanceDiscrepancies] = useState<any[]>([]);
@@ -1236,44 +1238,71 @@ export default function App() {
 
   const handleSyncAllSheets = async (isInitial = false) => {
     if (!isInitial) setSyncingAll(true);
+    setSyncProgress(0);
+    setSyncStatus("Menghubungkan ke Spreadsheet...");
     setMessage(null);
     try {
-      const response = await fetch("/api/fetch-api-url", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: apiUrl, syncAll: true }),
-      });
-
-      let result;
-      try {
-        result = await response.json();
-      } catch (e) {
-        throw new Error(`Error ${response.status}: ${response.statusText || "Gagal sinkronisasi semua data."}`);
+      // 1. Get list of sheets
+      const listRes = await fetch(`/api/sync-list?url=${encodeURIComponent(apiUrl)}`);
+      if (!listRes.ok) throw new Error("Gagal mengambil daftar sheet dari Spreadsheet.");
+      const listData = await listRes.json();
+      
+      if (!listData.available_sheets || !Array.isArray(listData.available_sheets)) {
+        throw new Error("Spreadsheet tidak memiliki sheet yang valid.");
       }
 
-      if (response.ok) {
-        const count = result.results.reduce((acc: number, r: any) => acc + r.count, 0);
-        const sheets = result.results.map((r: any) => r.sheet).join(", ");
-        if (!isInitial) {
-          setMessage({ 
-            type: "success", 
-            text: `Berhasil memperbarui ${count} baris data dari ${result.results.length} sheet: ${sheets}` 
+      const sheets = listData.available_sheets;
+      const results = [];
+      let totalCount = 0;
+
+      // 2. Sync each sheet one by one
+      for (let i = 0; i < sheets.length; i++) {
+        const sheetName = sheets[i];
+        setSyncStatus(`Sinkronisasi sheet: ${sheetName} (${i + 1}/${sheets.length})`);
+        setSyncProgress(Math.round(((i) / sheets.length) * 100));
+
+        try {
+          const res = await fetch("/api/fetch-api-url", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ url: apiUrl, period: "", syncAll: false, customSheet: sheetName }),
           });
+          
+          if (res.ok) {
+            const data = await res.json();
+            results.push({ sheet: sheetName, count: data.count || 0 });
+            totalCount += (data.count || 0);
+          } else {
+            console.error(`Gagal sinkronisasi sheet ${sheetName}`);
+          }
+        } catch (e) {
+          console.error(`Error syncing sheet ${sheetName}:`, e);
         }
-        await Promise.all([
-          fetchData(period),
-          fetchPeriods(),
-          fetchBudget(2026)
-        ]);
-        return true;
-      } else {
-        throw new Error(result.error || "Gagal sinkronisasi semua data.");
       }
+
+      setSyncProgress(100);
+      setSyncStatus("Sinkronisasi Selesai!");
+
+      if (!isInitial) {
+        setMessage({ 
+          type: "success", 
+          text: `Berhasil memperbarui ${totalCount} baris data dari ${results.length} sheet.` 
+        });
+      }
+      
+      await Promise.all([
+        fetchData(period),
+        fetchPeriods(),
+        fetchBudget(2026)
+      ]);
+      return true;
     } catch (error: any) {
       if (!isInitial) setMessage({ type: "error", text: error.message });
       throw error;
     } finally {
-      if (!isInitial) setSyncingAll(false);
+      if (!isInitial) {
+        setTimeout(() => setSyncingAll(false), 1000);
+      }
     }
   };
 
@@ -1501,6 +1530,41 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 font-sans">
+      {syncingAll && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-slate-900/80 backdrop-blur-sm">
+          <div className="bg-white p-8 rounded-2xl shadow-2xl max-w-md w-full text-center">
+            <div className="relative w-24 h-24 mx-auto mb-6">
+              <svg className="w-full h-full transform -rotate-90">
+                <circle
+                  cx="48"
+                  cy="48"
+                  r="40"
+                  stroke="currentColor"
+                  strokeWidth="8"
+                  fill="transparent"
+                  className="text-slate-100"
+                />
+                <circle
+                  cx="48"
+                  cy="48"
+                  r="40"
+                  stroke="currentColor"
+                  strokeWidth="8"
+                  fill="transparent"
+                  strokeDasharray={251.2}
+                  strokeDashoffset={251.2 - (251.2 * syncProgress) / 100}
+                  className="text-emerald-500 transition-all duration-500"
+                />
+              </svg>
+              <div className="absolute inset-0 flex items-center justify-center font-bold text-xl text-slate-900">
+                {syncProgress}%
+              </div>
+            </div>
+            <h3 className="text-lg font-bold text-slate-900 mb-2">Sinkronisasi Data</h3>
+            <p className="text-slate-500 text-sm animate-pulse">{syncStatus}</p>
+          </div>
+        </div>
+      )}
       {/* Top Navigation Bar - Excel Style */}
       <header className="bg-white border-b border-slate-200 sticky top-0 z-50 shadow-sm no-print">
         {/* Top Branding Bar */}

@@ -10,11 +10,12 @@ const __dirname = path.dirname(__filename);
 
 let db: any;
 try {
-  db = new Database("accounting.db");
+  const dbPath = process.env.VERCEL ? path.join("/tmp", "accounting.db") : "accounting.db";
+  db = new Database(dbPath);
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
 } catch (err) {
-  console.error("Failed to initialize database, using in-memory fallback for safety:", err);
+  console.error("Failed to initialize database, using in-memory fallback:", err);
   db = new Database(":memory:");
 }
 
@@ -265,10 +266,140 @@ async function startServer() {
     }
   });
 
+  app.get("/api/sync-list", async (req, res) => {
+    const targetBaseUrl = (req.query.url as string || FIXED_GAS_API_URL).trim();
+    try {
+      const listRes = await fetch(targetBaseUrl);
+      if (!listRes.ok) throw new Error(`GAS API Error: ${listRes.status}`);
+      const listResult = await listRes.json();
+      res.json(listResult);
+    } catch (error: any) {
+      console.error("Error fetching sheet list:", error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
   app.post("/api/fetch-api-url", async (req, res) => {
-    const { url, period, syncAll } = req.body;
+    const { url, period, syncAll, customSheet } = req.body;
     const targetBaseUrl = (url || FIXED_GAS_API_URL).trim();
     if (!targetBaseUrl) return res.status(400).json({ error: "URL API diperlukan" });
+
+    const monthMap: Record<string, string> = {
+      januari: "01", februari: "02", maret: "03", april: "04", mei: "05", juni: "06",
+      juli: "07", agustus: "08", september: "09", oktober: "10", nopember: "11", november: "11", desember: "12",
+      jan: "01", feb: "02", mar: "03", apr: "04", ags: "08", aug: "08", sep: "09", okt: "10", des: "12"
+    };
+
+    const processSheet = (sheetName: string, result: any, clearedBudgetYears: Set<number>) => {
+      if (!result.data || !Array.isArray(result.data)) return { count: 0 };
+      const rows = result.data;
+      const type = (result.type === "budget" || sheetName.toUpperCase().includes("RKAPB") || sheetName.toUpperCase().includes("BUDGET") || sheetName.toUpperCase().includes("ANGGARAN")) ? "budget" : (result.type || "trial_balance");
+
+      if (type === "trial_balance") {
+        let detectedPeriod = "";
+        const parts = sheetName.split(" ");
+        if (parts.length >= 2) {
+          const m = monthMap[parts[0].toLowerCase()];
+          const y = parts[1];
+          if (m && y) detectedPeriod = `${y}-${m}`;
+        }
+        
+        // Fallback to provided period if detection fails
+        const finalPeriod = detectedPeriod || period;
+        if (!finalPeriod) return { count: 0, error: "Period tidak terdeteksi" };
+
+        const insert = db.prepare(`
+          INSERT OR REPLACE INTO trial_balance 
+          (period, account_code, account_name, initial_debit, initial_credit, mutation_debit, mutation_credit, final_debit, final_credit)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+
+        const transaction = db.transaction((dataRows, p) => {
+          db.prepare("DELETE FROM trial_balance WHERE period = ?").run(p);
+          let inserted = 0;
+          let dataStarted = false;
+          for (const row of dataRows) {
+            const [code, name, initD, initK, mutD, mutK, finD, finK] = row;
+            if (!dataStarted) {
+              if (code && /^\d/.test(code.toString().trim())) dataStarted = true;
+              else continue;
+            }
+            if (!code || code.toString().trim() === "" || code.toString().toLowerCase() === "jumlah") continue;
+            insert.run(p, code.toString().trim().replace(/[.\s]/g, ''), name ? name.toString() : "", parseNum(initD), parseNum(initK), parseNum(mutD), parseNum(mutK), parseNum(finD), parseNum(finK));
+            inserted++;
+          }
+          return inserted;
+        });
+        const count = transaction(rows, finalPeriod);
+        return { count, type: "trial_balance", period: finalPeriod };
+      } else if (type === "budget") {
+        const yearMatch = sheetName.match(/\d{4}/);
+        const year = yearMatch ? parseInt(yearMatch[0]) : new Date().getFullYear();
+        
+        if (!clearedBudgetYears.has(year)) {
+          db.prepare("DELETE FROM budget WHERE year = ?").run(year);
+          clearedBudgetYears.add(year);
+        }
+
+        const insertBudget = db.prepare(`
+          INSERT INTO budget (year, month, account_code, account_name, amount)
+          VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(year, month, account_code) DO UPDATE SET amount = EXCLUDED.amount
+        `);
+
+        const transaction = db.transaction((dataRows, budgetYear) => {
+          let inserted = 0;
+          let dataStarted = false;
+          let janCol = -1;
+          let codeCol = -1;
+          let nameCol = -1;
+
+          for (let i = 0; i < Math.min(100, dataRows.length); i++) {
+            const r = dataRows[i];
+            if (!r || r.length < 3) continue;
+            const jIdx = r.findIndex((c: any) => {
+              const s = c?.toString().trim().toLowerCase();
+              return s === 'jan' || s === 'januari' || s === 'january';
+            });
+            if (jIdx !== -1) {
+              janCol = jIdx;
+              const cIdx = r.findIndex((c: any) => c && /no\.?\s*rek|kode|acc|account/i.test(c.toString().trim().toLowerCase()));
+              if (cIdx !== -1) codeCol = cIdx;
+              const nIdx = r.findIndex((c: any) => c && /uraian|nama|akun|rekening|description/i.test(c.toString().trim().toLowerCase()));
+              if (nIdx !== -1) nameCol = nIdx;
+              break;
+            }
+          }
+
+          if (janCol === -1) return 0;
+          if (codeCol === -1) codeCol = 0;
+          if (nameCol === -1) nameCol = 1;
+
+          for (const row of dataRows) {
+            const code = row[codeCol];
+            const name = row[nameCol];
+            if (!dataStarted) {
+              const cleanCode = code ? code.toString().trim().replace(/[.\s-]/g, '') : "";
+              if (cleanCode && /^\d+$/.test(cleanCode) && cleanCode.length >= 3) dataStarted = true;
+              else continue;
+            }
+            const cleanCode = code ? code.toString().trim().replace(/[.\s-]/g, '') : "";
+            if (!code || code.toString().trim() === "" || code.toString().toLowerCase() === "jumlah") continue;
+            for (let m = 1; m <= 12; m++) {
+              const colIdx = janCol + m - 1;
+              if (colIdx >= row.length) continue;
+              const amount = parseNum(row[colIdx]);
+              insertBudget.run(budgetYear, m, cleanCode, name ? name.toString() : "", amount);
+              inserted++;
+            }
+          }
+          return inserted;
+        });
+        const count = transaction(rows, year);
+        return { count, type: "budget", year };
+      }
+      return { count: 0 };
+    };
 
     try {
       if (syncAll) {
@@ -289,136 +420,9 @@ async function startServer() {
             const targetUrl = `${targetBaseUrl}${targetBaseUrl.includes('?') ? '&' : '?'}sheet=${encodeURIComponent(sheetName)}`;
             const response = await fetch(targetUrl);
             if (!response.ok) continue;
-            
             const result = await response.json();
-            if (!result.data || !Array.isArray(result.data)) continue;
-
-            const rows = result.data;
-            const type = (result.type === "budget" || sheetName.toUpperCase().includes("RKAPB") || sheetName.toUpperCase().includes("BUDGET") || sheetName.toUpperCase().includes("ANGGARAN")) ? "budget" : (result.type || "trial_balance");
-
-            if (type === "trial_balance") {
-              const monthMap: Record<string, string> = {
-                januari: "01", februari: "02", maret: "03", april: "04", mei: "05", juni: "06",
-                juli: "07", agustus: "08", september: "09", oktober: "10", nopember: "11", november: "11", desember: "12",
-                jan: "01", feb: "02", mar: "03", apr: "04", ags: "08", aug: "08", sep: "09", okt: "10", des: "12"
-              };
-              const parts = sheetName.split(" ");
-              let detectedPeriod = "";
-              if (parts.length >= 2) {
-                const m = monthMap[parts[0].toLowerCase()];
-                const y = parts[1];
-                if (m && y) detectedPeriod = `${y}-${m}`;
-              }
-
-              if (detectedPeriod) {
-                const insert = db.prepare(`
-                  INSERT OR REPLACE INTO trial_balance 
-                  (period, account_code, account_name, initial_debit, initial_credit, mutation_debit, mutation_credit, final_debit, final_credit)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                `);
-
-                const transaction = db.transaction((dataRows, finalPeriod) => {
-                  db.prepare("DELETE FROM trial_balance WHERE period = ?").run(finalPeriod);
-                  let inserted = 0;
-                  let dataStarted = false;
-                  for (const row of dataRows) {
-                    const [code, name, initD, initK, mutD, mutK, finD, finK] = row;
-                    if (!dataStarted) {
-                      if (code && /^\d/.test(code.toString().trim())) dataStarted = true;
-                      else continue;
-                    }
-                    if (!code || code.toString().trim() === "" || code.toString().toLowerCase() === "jumlah") continue;
-                    insert.run(finalPeriod, code.toString().trim().replace(/[.\s]/g, ''), name ? name.toString() : "", parseNum(initD), parseNum(initK), parseNum(mutD), parseNum(mutK), parseNum(finD), parseNum(finK));
-                    inserted++;
-                  }
-                  return inserted;
-                });
-                const count = transaction(rows, detectedPeriod);
-                allResults.push({ sheet: sheetName, type: "trial_balance", count, period: detectedPeriod });
-              }
-            } else if (type === "budget") {
-              const yearMatch = sheetName.match(/\d{4}/);
-              const year = yearMatch ? parseInt(yearMatch[0]) : new Date().getFullYear();
-              console.log(`[Sync] Processing budget sheet "${sheetName}" for year ${year}`);
-              
-              if (!clearedBudgetYears.has(year)) {
-                db.prepare("DELETE FROM budget WHERE year = ?").run(year);
-                clearedBudgetYears.add(year);
-              }
-
-              const insertBudget = db.prepare(`
-                INSERT INTO budget (year, month, account_code, account_name, amount)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(year, month, account_code) DO UPDATE SET amount = EXCLUDED.amount
-              `);
-
-              const transaction = db.transaction((dataRows, budgetYear) => {
-                let inserted = 0;
-                let dataStarted = false;
-                let janCol = -1;
-                let codeCol = -1;
-                let nameCol = -1;
-
-                for (let i = 0; i < Math.min(100, dataRows.length); i++) {
-                  const r = dataRows[i];
-                  if (!r || r.length < 3) continue;
-                  
-                  // Look for January column
-                  const jIdx = r.findIndex((c: any) => {
-                    const s = c?.toString().trim().toLowerCase();
-                    return s === 'jan' || s === 'januari' || s === 'january';
-                  });
-                  if (jIdx !== -1) {
-                    janCol = jIdx;
-                    
-                    // Look for Code column
-                    const cIdx = r.findIndex((c: any) => c && /no\.?\s*rek|kode|acc|account/i.test(c.toString().trim().toLowerCase()));
-                    if (cIdx !== -1) codeCol = cIdx;
-                    
-                    // Look for Name column
-                    const nIdx = r.findIndex((c: any) => c && /uraian|nama|akun|rekening|description/i.test(c.toString().trim().toLowerCase()));
-                    if (nIdx !== -1) nameCol = nIdx;
-                    
-                    console.log(`[Sync] Found budget header at row ${i}: janCol=${janCol}, codeCol=${codeCol}, nameCol=${nameCol}`);
-                    break;
-                  }
-                }
-
-                if (janCol === -1) {
-                  console.log(`[Sync] Could not find January column in sheet ${sheetName}`);
-                  return 0;
-                }
-                if (codeCol === -1) codeCol = 0;
-                if (nameCol === -1) nameCol = 1;
-
-                for (const row of dataRows) {
-                  const code = row[codeCol];
-                  const name = row[nameCol];
-                  if (!dataStarted) {
-                    const cleanCode = code ? code.toString().trim().replace(/[.\s-]/g, '') : "";
-                    // More lenient: start if code is numeric and length >= 3
-                    if (cleanCode && /^\d+$/.test(cleanCode) && cleanCode.length >= 3) {
-                      dataStarted = true;
-                    } else continue;
-                  }
-                  
-                  const cleanCode = code ? code.toString().trim().replace(/[.\s-]/g, '') : "";
-                  if (!code || code.toString().trim() === "" || code.toString().toLowerCase() === "jumlah") continue;
-                  
-                  for (let m = 1; m <= 12; m++) {
-                    const colIdx = janCol + m - 1;
-                    if (colIdx >= row.length) continue;
-                    const amount = parseNum(row[colIdx]);
-                    insertBudget.run(budgetYear, m, cleanCode, name ? name.toString() : "", amount);
-                    inserted++;
-                  }
-                }
-                return inserted;
-              });
-              const count = transaction(rows, year);
-              console.log(`[Sync] Inserted ${count} budget entries for ${year} from ${sheetName}`);
-              allResults.push({ sheet: sheetName, type: "budget", count, year });
-            }
+            const res = processSheet(sheetName, result, clearedBudgetYears);
+            allResults.push({ sheet: sheetName, ...res });
           } catch (e) {
             console.error(`Error syncing sheet ${sheetName}:`, e);
           }
@@ -426,7 +430,7 @@ async function startServer() {
         return res.json({ success: true, results: allResults });
       }
 
-      const sheetName = periodToSheetName(period);
+      const sheetName = customSheet || periodToSheetName(period);
       const targetUrl = `${targetBaseUrl}${targetBaseUrl.includes('?') ? '&' : '?'}sheet=${encodeURIComponent(sheetName)}`;
       
       console.log(`Fetching from GAS API: ${targetUrl}`);
@@ -434,51 +438,8 @@ async function startServer() {
       if (!response.ok) throw new Error(`GAS API Error: ${response.status}`);
       
       const result = await response.json();
-      if (!result.data || !Array.isArray(result.data)) {
-        throw new Error(result.error || "Format data API tidak valid");
-      }
-
-      const rows = result.data;
-      const type = result.type || "trial_balance";
-
-      if (type === "trial_balance") {
-        const insert = db.prepare(`
-          INSERT OR REPLACE INTO trial_balance 
-          (period, account_code, account_name, initial_debit, initial_credit, mutation_debit, mutation_credit, final_debit, final_credit)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `);
-
-        const transaction = db.transaction((dataRows, finalPeriod) => {
-          db.prepare("DELETE FROM trial_balance WHERE period = ?").run(finalPeriod);
-          let inserted = 0;
-          let dataStarted = false;
-
-          for (const row of dataRows) {
-            const [code, name, initD, initK, mutD, mutK, finD, finK] = row;
-            if (!dataStarted) {
-              if (code && /^\d/.test(code.toString().trim())) dataStarted = true;
-              else continue;
-            }
-            if (!code || code.toString().trim() === "" || code.toString().toLowerCase() === "jumlah") continue;
-            
-            insert.run(
-              finalPeriod,
-              code.toString().trim().replace(/[.\s]/g, ''),
-              name ? name.toString() : "",
-              parseNum(initD), parseNum(initK),
-              parseNum(mutD), parseNum(mutK),
-              parseNum(finD), parseNum(finK)
-            );
-            inserted++;
-          }
-          return inserted;
-        });
-
-        const count = transaction(rows, period);
-        return res.json({ success: true, count, period });
-      }
-
-      res.status(400).json({ error: "Tipe data API tidak didukung saat ini" });
+      const syncRes = processSheet(sheetName, result, new Set<number>());
+      return res.json({ success: true, ...syncRes });
     } catch (error: any) {
       console.error("Error in fetch-api-url:", error);
       res.status(500).json({ error: error.message });
@@ -845,14 +806,14 @@ async function startServer() {
     if (count.count === 0) {
       console.log("Database empty, performing initial sync...");
       try {
-        // We can't easily call the route handler directly, but we can call a fetch to ourselves
-        // or just run the logic. For simplicity, let's just log that it's ready for sync.
         console.log("Ready for initial synchronization. Please use the Import menu.");
       } catch (err) {
         console.error("Initial sync failed:", err);
       }
     }
   });
+
+  return app;
 }
 
 const app = await startServer();
