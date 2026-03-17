@@ -5224,30 +5224,10 @@ export default function App() {
                       <Zap className="w-6 h-6 text-white" />
                     </div>
                     <div>
-                      <h2 className="text-xl font-display font-bold text-slate-900 tracking-tight">Perhitungan EBITDA & EAT</h2>
-                      <p className="text-sm text-slate-500 font-medium">Analisis Profitabilitas • {period.split("-")[1] === "01" ? "JANUARI" : period.split("-")[1] === "02" ? "FEBRUARI" : period.split("-")[1] === "03" ? "MARET" : period.split("-")[1] === "04" ? "APRIL" : period.split("-")[1] === "05" ? "MEI" : period.split("-")[1] === "06" ? "JUNI" : period.split("-")[1] === "07" ? "JULI" : period.split("-")[1] === "08" ? "AGUSTUS" : period.split("-")[1] === "09" ? "SEPTEMBER" : period.split("-")[1] === "10" ? "OKTOBER" : period.split("-")[1] === "11" ? "NOVEMBER" : "DESEMBER"} {period.split("-")[0]}</p>
+                      <h2 className="text-xl font-display font-bold text-slate-900 tracking-tight">Perhitungan EBITDA & EAT Tahunan</h2>
                     </div>
                   </div>
                   <div className="flex items-center gap-3">
-                    <div className="flex items-center gap-2 bg-white border border-slate-200 rounded-lg px-3 py-2 shadow-sm">
-                      <Calendar className="w-4 h-4 text-emerald-600" />
-                      <select 
-                        value={period}
-                        onChange={(e) => setPeriod(e.target.value)}
-                        className="bg-transparent border-none focus:ring-0 text-sm font-bold text-slate-700 outline-none"
-                      >
-                        {periods.map(p => (
-                          <option key={p} value={p}>{p}</option>
-                        ))}
-                      </select>
-                    </div>
-                    <button 
-                      onClick={() => window.print()}
-                      className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-200 rounded-lg text-sm font-bold text-slate-700 hover:bg-slate-50 transition-all shadow-sm"
-                    >
-                      <Printer className="w-4 h-4" />
-                      Cetak
-                    </button>
                   </div>
                 </div>
               </div>

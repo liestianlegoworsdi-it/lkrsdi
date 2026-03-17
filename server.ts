@@ -8,9 +8,15 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const db = new Database("accounting.db");
-db.pragma('journal_mode = WAL');
-db.pragma('synchronous = NORMAL');
+let db: any;
+try {
+  db = new Database("accounting.db");
+  db.pragma('journal_mode = WAL');
+  db.pragma('synchronous = NORMAL');
+} catch (err) {
+  console.error("Failed to initialize database, using in-memory fallback for safety:", err);
+  db = new Database(":memory:");
+}
 
 const parseNum = (val: any) => {
   if (typeof val === 'number') return val;
@@ -827,6 +833,10 @@ async function startServer() {
     });
   }
 
+  if (process.env.VERCEL) {
+    return app;
+  }
+
   app.listen(PORT, "0.0.0.0", async () => {
     console.log(`Server running on http://localhost:${PORT}`);
     
@@ -845,4 +855,5 @@ async function startServer() {
   });
 }
 
-startServer();
+const app = await startServer();
+export default app;
