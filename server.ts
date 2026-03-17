@@ -494,6 +494,16 @@ async function startServer() {
     }
   });
 
+  app.get("/api/neraca-saldo-year", (req, res) => {
+    const { year } = req.query;
+    if (!year) {
+      return res.status(400).json({ error: "Year is required" });
+    }
+
+    const data = db.prepare("SELECT * FROM trial_balance WHERE period LIKE ? ORDER BY period ASC, account_code ASC").all(`${year}-%`);
+    res.json(data);
+  });
+
   app.get("/api/neraca-saldo", (req, res) => {
     const { period } = req.query;
     if (!period) {
@@ -504,9 +514,289 @@ async function startServer() {
     res.json(data);
   });
 
+  app.get("/api/neraca-saldo-ytd", (req, res) => {
+    const { period } = req.query;
+    if (!period) {
+      return res.status(400).json({ error: "Period is required" });
+    }
+
+    const [year, month] = (period as string).split("-");
+    const startPeriod = `${year}-01`;
+    const endPeriod = period;
+
+    // Aggregate YTD: 
+    // - For P&L (4,5,6): Sum final_debit/credit across all periods
+    // - For Balance Sheet (1,2,3): Take final_debit/credit from the LATEST period
+    // - initial_debit/credit: Take from the FIRST period (Jan)
+    const data = db.prepare(`
+      SELECT 
+        account_code, 
+        MAX(account_name) as account_name,
+        SUM(CASE 
+          WHEN (account_code LIKE '4%' OR account_code LIKE '5%' OR account_code LIKE '6%') THEN final_debit 
+          WHEN period = ? THEN final_debit 
+          ELSE 0 
+        END) as final_debit,
+        SUM(CASE 
+          WHEN (account_code LIKE '4%' OR account_code LIKE '5%' OR account_code LIKE '6%') THEN final_credit 
+          WHEN period = ? THEN final_credit 
+          ELSE 0 
+        END) as final_credit,
+        SUM(CASE WHEN period = ? THEN initial_debit ELSE 0 END) as initial_debit,
+        SUM(CASE WHEN period = ? THEN initial_credit ELSE 0 END) as initial_credit
+      FROM trial_balance 
+      WHERE period >= ? AND period <= ?
+      GROUP BY account_code
+      ORDER BY account_code ASC
+    `).all(endPeriod, endPeriod, startPeriod, startPeriod, startPeriod, endPeriod);
+    
+    res.json(data);
+  });
+
   app.get("/api/periods", (req, res) => {
     const periods = db.prepare("SELECT DISTINCT period FROM trial_balance ORDER BY period DESC").all();
     res.json(periods.map((p: any) => p.period));
+  });
+
+  app.get("/api/balance-check", (req, res) => {
+    try {
+      const { period } = req.query;
+      let periods = db.prepare("SELECT DISTINCT period FROM trial_balance ORDER BY period ASC").all().map((p: any) => p.period);
+      
+      if (period) {
+        const targetPeriod = period as string;
+        const targetIdx = periods.indexOf(targetPeriod);
+        if (targetIdx <= 0) {
+          // No predecessor or period not found
+          return res.json({ success: true, discrepancies: [] });
+        }
+        // Only check the transition to the target period
+        periods = [periods[targetIdx - 1], targetPeriod];
+      }
+
+      const discrepancies: any[] = [];
+
+      for (let i = 1; i < periods.length; i++) {
+        const prevPeriod = periods[i - 1];
+        const currPeriod = periods[i];
+
+        const prevData = db.prepare("SELECT account_code, account_name, final_debit, final_credit FROM trial_balance WHERE period = ?").all(prevPeriod);
+        const currData = db.prepare("SELECT account_code, account_name, initial_debit, initial_credit, final_debit, final_credit FROM trial_balance WHERE period = ?").all(currPeriod);
+
+        const currMap = new Map();
+        currData.forEach((item: any) => currMap.set(item.account_code, item));
+
+        // 1. General Balance Check (Prev Final vs Curr Initial)
+        prevData.forEach((prev: any) => {
+          // Exclude revenue (4), expenses (5), and tax estimation (611000000)
+          if (prev.account_code.startsWith('4') || prev.account_code.startsWith('5') || prev.account_code === '611000000') {
+            return;
+          }
+
+          const curr = currMap.get(prev.account_code);
+          if (curr) {
+            const diffDebit = Math.abs(prev.final_debit - curr.initial_debit);
+            const diffCredit = Math.abs(prev.final_credit - curr.initial_credit);
+
+            if (diffDebit > 0.01 || diffCredit > 0.01) {
+              discrepancies.push({
+                type: "Balance Mismatch",
+                account_code: prev.account_code,
+                account_name: prev.account_name,
+                prev_period: prevPeriod,
+                curr_period: currPeriod,
+                prev_final_debit: prev.final_debit,
+                curr_initial_debit: curr.initial_debit,
+                prev_final_credit: prev.final_credit,
+                curr_initial_credit: curr.initial_credit,
+                gap_debit: prev.final_debit - curr.initial_debit,
+                gap_credit: prev.final_credit - curr.initial_credit
+              });
+            }
+          } else {
+            // Account exists in prev but not in curr
+            if (Math.abs(prev.final_debit) > 0.01 || Math.abs(prev.final_credit) > 0.01) {
+              discrepancies.push({
+                type: "Missing Account",
+                account_code: prev.account_code,
+                account_name: prev.account_name,
+                prev_period: prevPeriod,
+                curr_period: currPeriod,
+                prev_final_debit: prev.final_debit,
+                curr_initial_debit: 0,
+                prev_final_credit: prev.final_credit,
+                curr_initial_credit: 0,
+                gap_debit: prev.final_debit,
+                gap_credit: prev.final_credit,
+                message: "Akun tidak ditemukan di periode saat ini"
+              });
+            }
+          }
+        });
+
+        // Also check accounts in curr but not in prev
+        currData.forEach((curr: any) => {
+          // Exclude revenue (4), expenses (5), and tax estimation (611000000)
+          if (curr.account_code.startsWith('4') || curr.account_code.startsWith('5') || curr.account_code === '611000000') {
+            return;
+          }
+
+          const prev = prevData.find((p: any) => p.account_code === curr.account_code);
+          if (!prev) {
+            if (Math.abs(curr.initial_debit) > 0.01 || Math.abs(curr.initial_credit) > 0.01) {
+              discrepancies.push({
+                type: "New Account with Balance",
+                account_code: curr.account_code,
+                account_name: curr.account_name,
+                prev_period: prevPeriod,
+                curr_period: currPeriod,
+                prev_final_debit: 0,
+                curr_initial_debit: curr.initial_debit,
+                prev_final_credit: 0,
+                curr_initial_credit: curr.initial_credit,
+                gap_debit: -curr.initial_debit,
+                gap_credit: -curr.initial_credit,
+                message: "Akun baru di periode saat ini dengan saldo awal tidak nol"
+              });
+            }
+          }
+        });
+
+        // 2. Cash Flow vs Balance Sheet (Initial Cash)
+        // Arus Kas Awal = Sum of (prev.final_debit - prev.final_credit) for 11101 and 11102
+        // Neraca Awal = Sum of (curr.initial_debit - curr.initial_credit) for 11101 and 11102
+        const getCashVal = (dataset: any[], fieldD: string, fieldK: string) => {
+          return dataset
+            .filter(i => i.account_code.startsWith('11101') || i.account_code.startsWith('11102'))
+            .reduce((acc, i) => acc + (i[fieldD] - i[fieldK]), 0);
+        };
+
+        const cashAwalArusKas = getCashVal(prevData, 'final_debit', 'final_credit');
+        const cashAwalNeraca = getCashVal(currData, 'initial_debit', 'initial_credit');
+
+        if (Math.abs(cashAwalArusKas - cashAwalNeraca) > 0.01) {
+          discrepancies.push({
+            type: "Cash Flow Sync",
+            message: "Kas Awal di Arus Kas tidak sama dengan Kas Awal di Neraca",
+            curr_period: currPeriod,
+            val1: cashAwalArusKas,
+            val2: cashAwalNeraca,
+            gap: cashAwalArusKas - cashAwalNeraca
+          });
+        }
+
+        // 3. Tax Estimation Check (P&L vs CALK 4.6)
+        const getPLVal = (dataset: any[], prefix: string, isRevenue = false) => {
+          return dataset
+            .filter(i => i.account_code.startsWith(prefix))
+            .reduce((acc, i) => acc + (isRevenue ? (i.final_credit - i.final_debit) : (i.final_debit - i.final_credit)), 0);
+        };
+
+        // EBT Calculation
+        const revTotal = getPLVal(currData, '41', true) + getPLVal(currData, '42', true) + getPLVal(currData, '43', true);
+        const hppTotal = getPLVal(currData, '51');
+        const opExTotal = getPLVal(currData, '52');
+        const otherExTotal = getPLVal(currData, '531');
+        const depAmorTotal = getPLVal(currData, '54');
+        
+        const ebt = revTotal - hppTotal - opExTotal - otherExTotal - depAmorTotal;
+        
+        const sumbangan = getPLVal(currData, '531040000');
+        const bebanPajak = getPLVal(currData, '521021700');
+        const bebanPajakBungaBank = getPLVal(currData, '531010000');
+        const totalKoreksiPositif = sumbangan + bebanPajak + bebanPajakBungaBank;
+        
+        const pendapatanBungaBank = getPLVal(currData, '431010100', true) + 
+                                  getPLVal(currData, '431010200', true) + 
+                                  getPLVal(currData, '431010300', true) + 
+                                  getPLVal(currData, '431010400', true);
+        
+        const labaSetelahKoreksi = ebt + totalKoreksiPositif - pendapatanBungaBank;
+        const pembulatan = labaSetelahKoreksi % 1000;
+        const labaKenaPajak = labaSetelahKoreksi - (pembulatan > 0 ? pembulatan : 0);
+        
+        const calculatedTax = labaKenaPajak * 0.22;
+        const recordedTax = getPLVal(currData, '611');
+
+        if (Math.abs(calculatedTax - recordedTax) > 1) { // Allow small rounding diff
+          discrepancies.push({
+            type: "Tax Calculation Sync",
+            message: "Taksiran Pajak di Laba Rugi tidak sesuai dengan perhitungan CALK 4.6",
+            curr_period: currPeriod,
+            val1: recordedTax,
+            val2: calculatedTax,
+            gap: recordedTax - calculatedTax
+          });
+        }
+
+        // 4. Cash Flow vs Balance Sheet (Ending Cash)
+        const getVal = (dataset: any[], prefix: string, isAsset = true) => {
+          return dataset
+            .filter(i => i.account_code.startsWith(prefix))
+            .reduce((acc, i) => acc + (isAsset ? (i.final_debit - i.final_credit) : (i.final_credit - i.final_debit)), 0);
+        };
+
+        const getPrevVal = (dataset: any[], prefix: string, isAsset = true) => {
+          return dataset
+            .filter(i => i.account_code.startsWith(prefix))
+            .reduce((acc, i) => acc + (isAsset ? (i.final_debit - i.final_credit) : (i.final_credit - i.final_debit)), 0);
+        };
+
+        const netProfit = ebt - recordedTax;
+        const dep = getPLVal(currData, "541");
+        
+        const op = netProfit + dep + 
+                  (getPrevVal(prevData, "11201") - getVal(currData, "11201")) +
+                  (getPrevVal(prevData, "11202") - getVal(currData, "11202")) +
+                  (getPrevVal(prevData, "113") - getVal(currData, "113")) +
+                  ((getPrevVal(prevData, "114") + getPrevVal(prevData, "115") + getPrevVal(prevData, "116")) - (getVal(currData, "114") + getVal(currData, "115") + getVal(currData, "116"))) +
+                  (getVal(currData, "21", false) - getPrevVal(prevData, "21", false));
+
+        const inv = (getPrevVal(prevData, "11103") - getVal(currData, "11103")) +
+                  (getPrevVal(prevData, "12102") - getVal(currData, "12102")) +
+                  (getPrevVal(prevData, "12104") - getVal(currData, "12104")) +
+                  (getPrevVal(prevData, "12106") - getVal(currData, "12106")) +
+                  (getPrevVal(prevData, "12103") - getVal(currData, "12103")) +
+                  (getPrevVal(prevData, "131") - getVal(currData, "131")) +
+                  (getPrevVal(prevData, "123010000") - getVal(currData, "123010000")) + (getPrevVal(prevData, "123020000") - getVal(currData, "123020000")) + (getPrevVal(prevData, "12101") - getVal(currData, "12101"));
+
+        const fin = (getVal(currData, "22", false) - getPrevVal(prevData, "22", false)) +
+                  (getVal(currData, "331", false) - getPrevVal(prevData, "331", false));
+
+        const totalChange = op + inv + fin;
+        const cashAkhirArusKas = cashAwalArusKas + totalChange;
+        const cashAkhirNeraca = getCashVal(currData, 'final_debit', 'final_credit');
+
+        if (Math.abs(cashAkhirArusKas - cashAkhirNeraca) > 1) {
+          discrepancies.push({
+            type: "Cash Flow Sync",
+            message: "Kas Akhir di Arus Kas tidak sama dengan Kas Akhir di Neraca",
+            curr_period: currPeriod,
+            val1: cashAkhirArusKas,
+            val2: cashAkhirNeraca,
+            gap: cashAkhirArusKas - cashAkhirNeraca
+          });
+        }
+
+        // 5. Trial Balance Equilibrium Check
+        const totalDebit = currData.reduce((acc: number, i: any) => acc + i.final_debit, 0);
+        const totalCredit = currData.reduce((acc: number, i: any) => acc + i.final_credit, 0);
+        if (Math.abs(totalDebit - totalCredit) > 0.01) {
+          discrepancies.push({
+            type: "Trial Balance Out of Balance",
+            message: "Neraca Saldo tidak seimbang (Debit != Kredit)",
+            curr_period: currPeriod,
+            val1: totalDebit,
+            val2: totalCredit,
+            gap: totalDebit - totalCredit
+          });
+        }
+      }
+
+      res.json({ success: true, discrepancies });
+    } catch (error: any) {
+      res.status(500).json({ success: false, error: error.message });
+    }
   });
 
   // Delete data for a specific period
