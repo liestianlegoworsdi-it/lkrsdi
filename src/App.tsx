@@ -1262,6 +1262,9 @@ export default function App() {
         setSyncProgress(Math.round(((i) / sheets.length) * 100));
 
         try {
+          // Add a small delay between requests to avoid rate limits
+          if (i > 0) await new Promise(resolve => setTimeout(resolve, 500));
+
           const res = await fetch("/api/fetch-api-url", {
             method: "POST",
             headers: { "Content-Type": "application/json" },

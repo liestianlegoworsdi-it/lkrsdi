@@ -10,13 +10,46 @@ const __dirname = path.dirname(__filename);
 
 let db: any;
 try {
-  const dbPath = process.env.VERCEL ? path.join("/tmp", "accounting.db") : "accounting.db";
+  const dbPath = process.env.VERCEL ? path.join("/tmp", "accounting.db") : path.join(process.cwd(), "accounting.db");
+  console.log(`Initializing database at: ${dbPath}`);
   db = new Database(dbPath);
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
 } catch (err) {
   console.error("Failed to initialize database, using in-memory fallback:", err);
   db = new Database(":memory:");
+}
+
+// Initialize database tables with error handling
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS trial_balance (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      period TEXT,
+      account_code TEXT,
+      account_name TEXT,
+      initial_debit REAL,
+      initial_credit REAL,
+      mutation_debit REAL,
+      mutation_credit REAL,
+      final_debit REAL,
+      final_credit REAL,
+      UNIQUE(period, account_code)
+    );
+    
+    CREATE TABLE IF NOT EXISTS budget (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      year INTEGER,
+      month INTEGER,
+      account_code TEXT,
+      account_name TEXT,
+      amount REAL,
+      UNIQUE(year, month, account_code)
+    );
+  `);
+  console.log("Database tables initialized successfully");
+} catch (err) {
+  console.error("Error creating database tables:", err);
 }
 
 const parseNum = (val: any) => {
@@ -59,32 +92,7 @@ const parseNum = (val: any) => {
   return isNegative ? -finalVal : finalVal;
 };
 
-// Initialize database
-db.exec(`
-  CREATE TABLE IF NOT EXISTS trial_balance (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    period TEXT,
-    account_code TEXT,
-    account_name TEXT,
-    initial_debit REAL,
-    initial_credit REAL,
-    mutation_debit REAL,
-    mutation_credit REAL,
-    final_debit REAL,
-    final_credit REAL,
-    UNIQUE(period, account_code)
-  );
-  
-  CREATE TABLE IF NOT EXISTS budget (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    year INTEGER,
-    month INTEGER,
-    account_code TEXT,
-    account_name TEXT,
-    amount REAL,
-    UNIQUE(year, month, account_code)
-  );
-`);
+// Database already initialized above
 
 const FIXED_GAS_API_URL = "https://script.google.com/macros/s/AKfycbzFaQeASp3y3mFM2QGfM6OA3_2YcP3-TcY4QjtxxViaj7j-Wxm7nLYeC0MfhagInHMR/exec";
 
@@ -268,14 +276,29 @@ async function startServer() {
 
   app.get("/api/sync-list", async (req, res) => {
     const targetBaseUrl = (req.query.url as string || FIXED_GAS_API_URL).trim();
+    console.log(`Fetching sheet list from: ${targetBaseUrl}`);
     try {
-      const listRes = await fetch(targetBaseUrl);
-      if (!listRes.ok) throw new Error(`GAS API Error: ${listRes.status}`);
-      const listResult = await listRes.json();
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s timeout
+
+      const listRes = await fetch(targetBaseUrl, { signal: controller.signal });
+      clearTimeout(timeoutId);
+
+      if (!listRes.ok) throw new Error(`GAS API Error: ${listRes.status} ${listRes.statusText}`);
+      
+      const text = await listRes.text();
+      let listResult;
+      try {
+        listResult = JSON.parse(text);
+      } catch (e) {
+        console.error("Failed to parse GAS API response as JSON:", text.slice(0, 200));
+        throw new Error("Respon dari Spreadsheet bukan format JSON yang valid");
+      }
+      
       res.json(listResult);
     } catch (error: any) {
       console.error("Error fetching sheet list:", error);
-      res.status(500).json({ error: error.message });
+      res.status(500).json({ error: error.name === 'AbortError' ? 'Request timeout (15s)' : error.message });
     }
   });
 
@@ -402,11 +425,15 @@ async function startServer() {
     };
 
     try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 25000); // 25s timeout per sheet
+
       if (syncAll) {
-        console.log(`Full Sync from GAS API: ${targetBaseUrl}`);
-        const listRes = await fetch(targetBaseUrl);
+        console.log(`Full Sync started from: ${targetBaseUrl}`);
+        const listRes = await fetch(targetBaseUrl, { signal: controller.signal });
         if (!listRes.ok) throw new Error(`GAS API Error: ${listRes.status}`);
         const listResult = await listRes.json();
+        clearTimeout(timeoutId);
         
         if (!listResult.available_sheets || !Array.isArray(listResult.available_sheets)) {
           throw new Error("API tidak mengembalikan daftar sheet yang tersedia");
@@ -417,9 +444,17 @@ async function startServer() {
 
         for (const sheetName of listResult.available_sheets) {
           try {
+            const sheetController = new AbortController();
+            const sheetTimeoutId = setTimeout(() => sheetController.abort(), 20000);
+            
             const targetUrl = `${targetBaseUrl}${targetBaseUrl.includes('?') ? '&' : '?'}sheet=${encodeURIComponent(sheetName)}`;
-            const response = await fetch(targetUrl);
-            if (!response.ok) continue;
+            const response = await fetch(targetUrl, { signal: sheetController.signal });
+            clearTimeout(sheetTimeoutId);
+            
+            if (!response.ok) {
+              console.warn(`Failed to fetch sheet ${sheetName}: ${response.status}`);
+              continue;
+            }
             const result = await response.json();
             const res = processSheet(sheetName, result, clearedBudgetYears);
             allResults.push({ sheet: sheetName, ...res });
@@ -433,16 +468,19 @@ async function startServer() {
       const sheetName = customSheet || periodToSheetName(period);
       const targetUrl = `${targetBaseUrl}${targetBaseUrl.includes('?') ? '&' : '?'}sheet=${encodeURIComponent(sheetName)}`;
       
-      console.log(`Fetching from GAS API: ${targetUrl}`);
-      const response = await fetch(targetUrl);
-      if (!response.ok) throw new Error(`GAS API Error: ${response.status}`);
+      console.log(`Fetching sheet "${sheetName}" from: ${targetUrl}`);
+      const response = await fetch(targetUrl, { signal: controller.signal });
+      clearTimeout(timeoutId);
+      
+      if (!response.ok) throw new Error(`GAS API Error: ${response.status} ${response.statusText}`);
       
       const result = await response.json();
       const syncRes = processSheet(sheetName, result, new Set<number>());
       return res.json({ success: true, ...syncRes });
     } catch (error: any) {
       console.error("Error in fetch-api-url:", error);
-      res.status(500).json({ error: error.message });
+      const isTimeout = error.name === 'AbortError';
+      res.status(500).json({ error: isTimeout ? 'Request timeout' : error.message });
     }
   });
 
