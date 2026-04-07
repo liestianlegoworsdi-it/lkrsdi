@@ -1244,7 +1244,10 @@ export default function App() {
     try {
       // 1. Get list of sheets
       const listRes = await fetch(`/api/sync-list?url=${encodeURIComponent(apiUrl)}`);
-      if (!listRes.ok) throw new Error("Gagal mengambil daftar sheet dari Spreadsheet.");
+      if (!listRes.ok) {
+        const errorData = await listRes.json().catch(() => ({}));
+        throw new Error(errorData.error || "Gagal mengambil daftar sheet dari Spreadsheet.");
+      }
       const listData = await listRes.json();
       
       if (!listData.available_sheets || !Array.isArray(listData.available_sheets)) {
@@ -5961,7 +5964,19 @@ export default function App() {
                     </div>
 
                     <div>
-                      <label className="block text-xs font-bold text-slate-500 uppercase tracking-widest mb-2">Google Apps Script API URL</label>
+                      <div className="flex items-center justify-between mb-2">
+                        <label className="block text-xs font-bold text-slate-500 uppercase tracking-widest">Google Apps Script API URL</label>
+                        <button 
+                          onClick={() => {
+                            const defaultUrl = ((import.meta as any).env.VITE_GAS_API_URL as string) || "https://script.google.com/macros/s/AKfycbzFaQeASp3y3mFM2QGfM6OA3_2YcP3-TcY4QjtxxViaj7j-Wxm7nLYeC0MfhagInHMR/exec";
+                            setApiUrl(defaultUrl);
+                            localStorage.setItem("apiUrl", defaultUrl);
+                          }}
+                          className="text-[10px] font-bold text-emerald-600 hover:text-emerald-700 uppercase tracking-wider"
+                        >
+                          Reset ke Default
+                        </button>
+                      </div>
                       <input 
                         type="text" 
                         value={apiUrl}
@@ -5973,7 +5988,7 @@ export default function App() {
                         className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none transition-all"
                       />
                       <p className="mt-2 text-[10px] text-slate-400 leading-relaxed">
-                        Masukkan URL Web App dari Google Apps Script yang telah Anda deploy.
+                        Masukkan URL Web App dari Google Apps Script yang telah Anda deploy. Pastikan berakhiran /exec.
                       </p>
                     </div>
                     

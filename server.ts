@@ -275,7 +275,9 @@ async function startServer() {
   });
 
   app.get("/api/sync-list", async (req, res) => {
-    const targetBaseUrl = (req.query.url as string || FIXED_GAS_API_URL).trim();
+    const baseUrl = (req.query.url as string || FIXED_GAS_API_URL).trim();
+    const targetBaseUrl = baseUrl.includes('action=') ? baseUrl : `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}action=getMetadata`;
+    
     console.log(`Fetching sheet list from: ${targetBaseUrl}`);
     try {
       const controller = new AbortController();
@@ -292,10 +294,15 @@ async function startServer() {
         listResult = JSON.parse(text);
       } catch (e) {
         console.error("Failed to parse GAS API response as JSON:", text.slice(0, 200));
-        throw new Error("Respon dari Spreadsheet bukan format JSON yang valid");
+        throw new Error(`Respon dari Spreadsheet bukan format JSON yang valid. Pastikan URL Web App benar dan sudah di-deploy sebagai 'Anyone'. (Respon: ${text.slice(0, 50)}...)`);
       }
       
-      res.json(listResult);
+      // Handle the GAS response format { status: "success", data: { sheets: [...] } }
+      if (listResult.status === "success" && listResult.data && listResult.data.sheets) {
+        res.json({ available_sheets: listResult.data.sheets });
+      } else {
+        res.json(listResult);
+      }
     } catch (error: any) {
       console.error("Error fetching sheet list:", error);
       res.status(500).json({ error: error.name === 'AbortError' ? 'Request timeout (15s)' : error.message });
@@ -430,24 +437,30 @@ async function startServer() {
 
       if (syncAll) {
         console.log(`Full Sync started from: ${targetBaseUrl}`);
-        const listRes = await fetch(targetBaseUrl, { signal: controller.signal });
+        const listUrl = targetBaseUrl.includes('action=') ? targetBaseUrl : `${targetBaseUrl}${targetBaseUrl.includes('?') ? '&' : '?'}action=getMetadata`;
+        const listRes = await fetch(listUrl, { signal: controller.signal });
         if (!listRes.ok) throw new Error(`GAS API Error: ${listRes.status}`);
         const listResult = await listRes.json();
         clearTimeout(timeoutId);
         
-        if (!listResult.available_sheets || !Array.isArray(listResult.available_sheets)) {
+        // Handle GAS response format
+        const sheets = (listResult.status === "success" && listResult.data && listResult.data.sheets) 
+          ? listResult.data.sheets 
+          : (listResult.available_sheets || []);
+
+        if (!Array.isArray(sheets) || sheets.length === 0) {
           throw new Error("API tidak mengembalikan daftar sheet yang tersedia");
         }
 
         const allResults = [];
         const clearedBudgetYears = new Set<number>();
 
-        for (const sheetName of listResult.available_sheets) {
+        for (const sheetName of sheets) {
           try {
             const sheetController = new AbortController();
             const sheetTimeoutId = setTimeout(() => sheetController.abort(), 20000);
             
-            const targetUrl = `${targetBaseUrl}${targetBaseUrl.includes('?') ? '&' : '?'}sheet=${encodeURIComponent(sheetName)}`;
+            const targetUrl = `${targetBaseUrl}${targetBaseUrl.includes('?') ? '&' : '?'}action=exportData&sheetName=${encodeURIComponent(sheetName)}`;
             const response = await fetch(targetUrl, { signal: sheetController.signal });
             clearTimeout(sheetTimeoutId);
             
@@ -466,7 +479,7 @@ async function startServer() {
       }
 
       const sheetName = customSheet || periodToSheetName(period);
-      const targetUrl = `${targetBaseUrl}${targetBaseUrl.includes('?') ? '&' : '?'}sheet=${encodeURIComponent(sheetName)}`;
+      const targetUrl = `${targetBaseUrl}${targetBaseUrl.includes('?') ? '&' : '?'}action=exportData&sheetName=${encodeURIComponent(sheetName)}`;
       
       console.log(`Fetching sheet "${sheetName}" from: ${targetUrl}`);
       const response = await fetch(targetUrl, { signal: controller.signal });
