@@ -16,7 +16,7 @@
  */
 
 // GANTI DENGAN URL APLIKASI ANDA
-var APP_URL = "https://ais-dev-kskt52ompe5yavapwbdggd-281371416929.asia-southeast1.run.app";
+var APP_URL = "https://lkrsdi.vercel.app";
 
 /**
  * Menambahkan menu ke Google Sheets saat dibuka
