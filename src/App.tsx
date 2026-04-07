@@ -572,7 +572,7 @@ export default function App() {
   };
   
   // Simple Sheets State
-  const [apiUrl, setApiUrl] = useState(localStorage.getItem("apiUrl") || "https://script.google.com/macros/s/AKfycbzFaQeASp3y3mFM2QGfM6OA3_2YcP3-TcY4QjtxxViaj7j-Wxm7nLYeC0MfhagInHMR/exec");
+  const [apiUrl, setApiUrl] = useState(localStorage.getItem("apiUrl") || ((import.meta as any).env.VITE_GAS_API_URL as string) || "https://script.google.com/macros/s/AKfycbzFaQeASp3y3mFM2QGfM6OA3_2YcP3-TcY4QjtxxViaj7j-Wxm7nLYeC0MfhagInHMR/exec");
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [syncingAll, setSyncingAll] = useState(false);

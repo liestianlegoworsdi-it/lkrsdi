@@ -94,7 +94,7 @@ const parseNum = (val: any) => {
 
 // Database already initialized above
 
-const FIXED_GAS_API_URL = "https://script.google.com/macros/s/AKfycbzFaQeASp3y3mFM2QGfM6OA3_2YcP3-TcY4QjtxxViaj7j-Wxm7nLYeC0MfhagInHMR/exec";
+const FIXED_GAS_API_URL = process.env.GAS_API_URL || "https://script.google.com/macros/s/AKfycbzFaQeASp3y3mFM2QGfM6OA3_2YcP3-TcY4QjtxxViaj7j-Wxm7nLYeC0MfhagInHMR/exec";
 
 function periodToSheetName(period: string): string {
   const [year, month] = period.split("-");

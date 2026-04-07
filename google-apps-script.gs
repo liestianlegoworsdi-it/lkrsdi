@@ -167,7 +167,7 @@ function syncAllSheets() {
  * Mengirim data ke API aplikasi
  */
 function sendToApp(payload, sheetName, silent) {
-  var url = APP_URL + "/api/sync-push";
+  var url = (PropertiesService.getScriptProperties().getProperty('APP_URL') || APP_URL) + "/api/sync-push";
   var options = {
     method: 'post',
     contentType: 'application/json',
